@@ -145,11 +145,13 @@
     <div id="oido"></div>
     <div id="resultados"></div>
     <div class="ayuda">
-      <b>Cómo se usa:</b> pulsa el micrófono y di el aviso tal como llega:
-      <i>"fuga de amoníaco"</i>, <i>"incendio de gasolina"</i>, <i>"derrame de ácido nítrico"</i>…
+      <b>Cómo se usa:</b> di <b>«Vulcano»</b> seguido del aviso tal como llega:
+      <i>"Vulcano, fuga de amoníaco"</i>, <i>"Vulcano, incendio de gasolina"</i>…
+      También puedes pulsar el micrófono y decirlo sin «Vulcano», o escribirlo.
       La app detecta sustancia y escenario, confirma, y lee la ficha completa en voz alta.
       En la confirmación puedes decir <b>sí · no · está ardiendo · fuga</b>; si no dices nada, lee la ficha sola a los 5 segundos.
-      Comandos tras la lectura: <b>repite · distancias · recursos · está ardiendo · fuga · más despacio · silencio</b>. Los botones hacen lo mismo.
+      Comandos tras la lectura: <b>repite · repite riesgos · distancias · aproximación · protección · recursos · está ardiendo · fuga · más despacio · silencio</b>. Los botones hacen lo mismo.
+      <br>La primera vez, toca el micrófono una vez para dar permiso; a partir de ahí la app queda a la escucha al abrirse.
     </div>
   </section>
 
@@ -374,9 +376,10 @@ function seleccionarTipoConf(tipo){
   hablarConfirmacion(`Cambio a ${esc.etiqueta.toLowerCase()}. Leo la ficha en cinco segundos.`);
 }
 function volverAHome(hablado){
-  cancelarCuentaAtras(); modo="home"; callar(); pararComandos();
+  cancelarCuentaAtras(); modo="home"; callar();
   productoActual=null;
   pantalla("p-home");
+  setEstado(recCmd? "ESCUCHANDO":"EN ESPERA", recCmd? "escuchando":"");
   if(hablado) hablar(hablado);
 }
 
@@ -402,7 +405,7 @@ function construirGuion(prod, esc){
   else partes.push({texto:"La fuente no da zonificación numérica para este escenario.", bloqueId:"blk-zona"});
   if(esc.aproximacion) partes.push({texto:"Aproximación: "+esc.aproximacion, bloqueId:"blk-aprox"});
   if(esc.epi) partes.push({texto:"Protección: "+esc.epi, bloqueId:"blk-prot"});
-  partes.push({texto:"Di repite, distancias o recursos.", bloqueId:null});
+  partes.push({texto:"Di repite, o pide una parte: riesgos, distancias, aproximación, protección o recursos.", bloqueId:null});
   return partes;
 }
 function cap(s){ return s? s.charAt(0).toUpperCase()+s.slice(1):s; }
@@ -465,6 +468,18 @@ function ejecutarComando(cmd){
     case "recursos":
       locutar([{texto: esc.equipamiento? "Equipamiento. "+esc.equipamiento : "Sin datos de equipamiento en la fuente.", bloqueId:"blk-rec"}]);
       break;
+    case "rep-riesgos":
+      locutar([{texto: esc.riesgos? "Riesgos. "+esc.riesgos : "Sin datos de riesgos en la fuente.", bloqueId:"blk-peligro"}]);
+      break;
+    case "rep-aprox":
+      locutar([{texto: "Aproximación: "+(esc.aproximacion||"sin instrucción específica en la fuente. Criterio general: viento a la espalda."), bloqueId:"blk-aprox"}]);
+      break;
+    case "rep-prot":
+      locutar([{texto: esc.epi? "Protección: "+esc.epi : "Sin datos de protección en la fuente.", bloqueId:"blk-prot"}]);
+      break;
+    case "rep-id":
+      locutar([construirGuion(productoActual, esc)[0]]);
+      break;
     case "arde": cambiarEscenario("incendio","Cambio a escenario con incendio."); break;
     case "fuga": cambiarEscenario("fuga","Cambio a escenario de fuga sin incendio."); break;
     case "despacio": velocidad=Math.max(0.6,velocidad-0.15); hablar("Leo más despacio."); break;
@@ -472,9 +487,10 @@ function ejecutarComando(cmd){
     case "silencio": callar(); setEstado(recCmd?"ESCUCHANDO COMANDOS":"EN ESPERA", recCmd?"escuchando":""); break;
     case "nueva":
       cancelarCuentaAtras(); modo="home";
-      callar(); pararComandos(); productoActual=null;
+      callar(); productoActual=null;
       $("buscador").value=""; $("resultados").innerHTML=""; $("oido").textContent="";
       pantalla("p-home");
+      setEstado(recCmd? "ESCUCHANDO":"EN ESPERA", recCmd? "escuchando":"");
       break;
   }
 }
@@ -482,9 +498,14 @@ function interpretarComando(frase){
   const f = norm(frase);
   if(/mas despacio|despacio/.test(f)) return "despacio";
   if(/mas rapido|rapido/.test(f)) return "rapido";
-  if(/repite|repetir|otra vez/.test(f)) return "repite";
-  if(/distancia/.test(f)) return "distancias";
+  /* repetición por secciones (antes que el "repite" genérico) */
+  if(/riesgo|peligro/.test(f)) return "rep-riesgos";
+  if(/aproximacion|acceso|viento/.test(f)) return "rep-aprox";
+  if(/proteccion|\bepi\b|nivel|traje/.test(f)) return "rep-prot";
+  if(/distancia|zonificacion|\bzona\b|evacuacion|confinamiento/.test(f)) return "distancias";
   if(/recurso|equipamiento|medios/.test(f)) return "recursos";
+  if(/identificacion|confirmacion|\bonu\b|panel/.test(f)) return "rep-id";
+  if(/repite|repetir|otra vez|completa|entera/.test(f)) return "repite";
   if(/esta ardiendo|ardiendo|incendio|en llamas/.test(f)) return "arde";
   if(/fuga|no arde|sin incendio|apagado/.test(f)) return "fuga";
   if(/silencio|callate|calla|para ya/.test(f)) return "silencio";
@@ -512,8 +533,9 @@ function escucharSustancia(){
     $("btnMicro").classList.remove("grabando"); $("btnMicro").textContent="🎤 DECIR SUSTANCIA";
     setEstado("EN ESPERA",""); recSust=null;
     if(final) procesarFraseAviso(final);
+    if(modo==="home") iniciarComandos();   /* vuelve la escucha "Vulcano, …" */
   };
-  recSust.onerror = ()=>{ recSust=null; $("btnMicro").classList.remove("grabando"); $("btnMicro").textContent="🎤 DECIR SUSTANCIA"; setEstado("EN ESPERA",""); };
+  recSust.onerror = ()=>{ recSust=null; $("btnMicro").classList.remove("grabando"); $("btnMicro").textContent="🎤 DECIR SUSTANCIA"; setEstado("EN ESPERA",""); if(modo==="home") iniciarComandos(); };
   recSust.start();
 }
 function procesarFraseAviso(frase){
@@ -539,7 +561,18 @@ function iniciarComandos(){
   recCmd.lang="es-ES"; recCmd.continuous=true; recCmd.interimResults=false;
   recCmd.onresult = ev=>{
     const frase = ev.results[ev.results.length-1][0].transcript;
+    if(modo==="home"){
+      /* palabra de activación: "Vulcano, <aviso>" */
+      const f = norm(frase);
+      const m = f.match(/(?:ok\s+|oye\s+)?(?:vulcano|bulcano|volcano|vulkano)[\s,:.]+(.+)/);
+      if(m && m[1].trim().length>=3){
+        $("oido").textContent = "He oído: «"+m[1].trim()+"»";
+        procesarFraseAviso(m[1].trim());
+      }
+      return;
+    }
     if(modo==="conf"){
+      if(speechSynthesis.speaking) return;   /* no oírse a sí misma */
       const f = norm(frase);
       /* escenario primero: "no arde" debe cambiar a fuga, no cancelar */
       if(/fuga|derrame|sin incendio|no arde|apagado|sin fuego/.test(f)){ seleccionarTipoConf("fuga"); return; }
@@ -549,11 +582,14 @@ function iniciarComandos(){
       return;
     }
     const cmd = interpretarComando(frase);
-    if(cmd) ejecutarComando(cmd);
+    if(!cmd) return;
+    /* mientras la app habla, solo órdenes de corte (evita que se dispare con su propia voz) */
+    if((hablando||speechSynthesis.speaking) && !/^(silencio|arde|fuga|nueva|despacio|rapido)$/.test(cmd)) return;
+    ejecutarComando(cmd);
   };
   recCmd.onend = ()=>{ if(recCmd){ try{recCmd.start();}catch(e){} } };
   recCmd.onerror = e=>{ if(e.error==="not-allowed") pararComandos(); };
-  try{ recCmd.start(); }catch(e){}
+  try{ recCmd.start(); setEstado("ESCUCHANDO","escuchando"); }catch(e){}
 }
 function pararComandos(){
   if(recCmd){ const r=recCmd; recCmd=null; try{r.stop();}catch(e){} }
@@ -566,6 +602,12 @@ $("btnSi").onclick = ()=> leerFicha();
 $("btnNo").onclick = ()=> volverAHome(null);
 document.querySelectorAll("#botonera .bgrande").forEach(b=>{ b.onclick=()=>ejecutarComando(b.dataset.cmd); });
 speechSynthesis.onvoiceschanged = ()=>{};
+
+/* Arranque: si ya hay permiso de micro, queda a la escucha de "Vulcano, <sustancia>".
+   La primera visita requiere un toque (política del navegador). */
+window.addEventListener("load", ()=>{
+  if(SR) setTimeout(()=>{ if(modo==="home" && !recSust && !recCmd) iniciarComandos(); }, 800);
+});
 </script>
 </body>
 </html>
