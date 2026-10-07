@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <meta name="theme-color" content="#0d1421">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
 <title>VULCANO — Ficha de camino (PRUEBA)</title>
 <style>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
@@ -198,6 +200,11 @@ let recCmd = null;
 let recSust = null;
 let modo = "home";      /* home | conf | lectura */
 let confTimer = null;   /* cuenta atrás de la confirmación */
+let finTTS = 0;         /* instante en que terminó la última locución (anti auto-escucha) */
+let ttsGen = 0;         /* generación de TTS: callar() la incrementa y cancela hablar() en curso */
+let locutarRun = 0;     /* generación de locutar(): una nueva locución invalida la anterior */
+let recFallos = 0;      /* reintentos de reconocimiento con espera creciente */
+let wakeLock = null;    /* mantiene la pantalla encendida durante la intervención */
 
 const $ = id => document.getElementById(id);
 const norm = s => (s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"");
@@ -230,31 +237,53 @@ function vozEs(){
   const voces = speechSynthesis.getVoices();
   return voces.find(v=>/es[-_]ES/i.test(v.lang)) || voces.find(v=>/^es/i.test(v.lang)) || null;
 }
+/* Trocea el texto en frases (~180 caracteres) para evitar el corte de
+   utterances largas en Chrome, y marca finTTS al acabar cada trozo. */
+function trocearParaVoz(t){
+  const frases = t.match(/[^.;:!?]+[.;:!?]*/g) || [t];
+  const grupos = [];
+  let actual = "";
+  for(const fr of frases){
+    if(actual && (actual.length + fr.length) > 180){ grupos.push(actual); actual = fr; }
+    else actual += fr;
+  }
+  if(actual.trim()) grupos.push(actual);
+  return grupos;
+}
 function hablar(texto, opts={}){
-  return new Promise(res=>{
-    const u = new SpeechSynthesisUtterance(limpiarParaVoz(texto));
+  const g = ttsGen;
+  const trozos = trocearParaVoz(limpiarParaVoz(texto));
+  return trozos.reduce((cadena, trozo)=>cadena.then(()=>new Promise(res=>{
+    if(g!==ttsGen){ res(); return; }           /* cancelado por callar() */
+    const u = new SpeechSynthesisUtterance(trozo);
     const v = vozEs(); if(v) u.voice=v;
     u.lang="es-ES";
     u.rate=(opts.rate||1.0)*velocidad;
-    u.onend=res; u.onerror=res;
+    u.onend=()=>{ finTTS=Date.now(); res(); };
+    u.onerror=()=>{ finTTS=Date.now(); res(); };
     speechSynthesis.speak(u);
-  });
+  })), Promise.resolve());
 }
 async function locutar(secuencia){
+  ttsGen++;
+  const run = ++locutarRun;
   speechSynthesis.cancel();
   hablando = true;
   setEstado("HABLANDO","hablando");
   for(const parte of secuencia){
-    if(!hablando) break;
+    if(run!==locutarRun || !hablando) break;
     marcarBloque(parte.bloqueId);
     await hablar(parte.texto,{rate:parte.rate||1.0});
+    if(run!==locutarRun) break;
     if(parte.repetir && hablando) await hablar(parte.texto,{rate:parte.rate||1.0});
   }
+  if(run!==locutarRun) return;   /* otra locución tomó el relevo: no tocar su estado */
   marcarBloque(null);
   hablando = false;
+  finTTS = Date.now();
   setEstado(recCmd? "ESCUCHANDO COMANDOS":"EN ESPERA", recCmd? "escuchando":"");
 }
-function callar(){ hablando=false; speechSynthesis.cancel(); marcarBloque(null); }
+function callar(){ hablando=false; ttsGen++; finTTS=Date.now(); speechSynthesis.cancel(); marcarBloque(null); }
 function marcarBloque(id){
   document.querySelectorAll(".bloque").forEach(b=>b.classList.remove("leyendo"));
   if(id){ const b=$(id); if(b){ b.classList.add("leyendo"); b.scrollIntoView({block:"center",behavior:"smooth"}); } }
@@ -273,7 +302,7 @@ function buscar(q){
 }
 function detectarEscenario(frase){
   const f = norm(frase);
-  if(/incendi|ardiendo|arde |en llamas|fuego|inflamad/.test(f)) return "incendio";
+  if(/incendi|ardiendo|\barde\b|en llamas|fuego|inflamad/.test(f)) return "incendio";
   if(/fuga|derrame|escape|vertido|charco/.test(f)) return "fuga";
   return null;
 }
@@ -296,7 +325,8 @@ function elegirEscenario(p, tipo){
     const i = p.escenarios.findIndex(e=>e.tipo===tipo);
     if(i>=0) return i;
   }
-  const i = p.escenarios.findIndex(e=>e.tipo==="fuga");
+  /* Sin información del tipo de suceso, caso más desfavorable: incendio */
+  const i = p.escenarios.findIndex(e=>e.tipo==="incendio");
   return i>=0? i:0;
 }
 function irAConfirmacion(prod, tipoDetectado){
@@ -399,12 +429,13 @@ function construirGuion(prod, esc){
   intro += ` Escenario: ${esc.etiqueta.toLowerCase()}.`;
   if(prod.variante) intro += ` Atención, variante: ${prod.variante} Sin dato, aplico el caso más desfavorable.`;
   partes.push({texto:intro, bloqueId:"blk-id"});
-  if(esc.riesgos) partes.push({texto:"Riesgos. "+esc.riesgos, bloqueId:"blk-peligro"});
+  /* Los huecos se dicen en voz alta: el silencio se confunde con "sin riesgo" */
+  partes.push({texto: esc.riesgos? "Riesgos. "+esc.riesgos : "Riesgos: sin datos en la fuente.", bloqueId:"blk-peligro"});
   const z = textoZona(esc);
   if(z) partes.push({texto:z, bloqueId:"blk-zona", rate:0.85, repetir:true});
   else partes.push({texto:"La fuente no da zonificación numérica para este escenario.", bloqueId:"blk-zona"});
-  if(esc.aproximacion) partes.push({texto:"Aproximación: "+esc.aproximacion, bloqueId:"blk-aprox"});
-  if(esc.epi) partes.push({texto:"Protección: "+esc.epi, bloqueId:"blk-prot"});
+  partes.push({texto: esc.aproximacion? "Aproximación: "+esc.aproximacion : "Aproximación: sin instrucción específica en la fuente. Criterio general, no procedente de la ficha: viento a la espalda.", bloqueId:"blk-aprox"});
+  partes.push({texto: esc.epi? "Protección: "+esc.epi : "Protección: sin datos en la fuente.", bloqueId:"blk-prot"});
   partes.push({texto:"Di repite, o pide una parte: riesgos, distancias, aproximación, protección o recursos.", bloqueId:null});
   return partes;
 }
@@ -453,7 +484,7 @@ function cambiarEscenario(tipo, fraseAviso){
   if(i<0 || i===escIdx) return;
   escIdx = i;
   callar();
-  hablar(fraseAviso).then(()=>leerFicha());
+  hablar(fraseAviso).then(()=>{ if(modo!=="home") leerFicha(); });
 }
 function ejecutarComando(cmd){
   if(!productoActual && cmd!=="nueva" && cmd!=="silencio") return;
@@ -572,7 +603,8 @@ function iniciarComandos(){
       return;
     }
     if(modo==="conf"){
-      if(speechSynthesis.speaking) return;   /* no oírse a sí misma */
+      /* no oírse a sí misma: ni mientras habla ni en el eco de 1,2 s posterior */
+      if(hablando || speechSynthesis.speaking || Date.now()-finTTS<1200) return;
       const f = norm(frase);
       /* escenario primero: "no arde" debe cambiar a fuga, no cancelar */
       if(/fuga|derrame|sin incendio|no arde|apagado|sin fuego/.test(f)){ seleccionarTipoConf("fuga"); return; }
@@ -583,12 +615,33 @@ function iniciarComandos(){
     }
     const cmd = interpretarComando(frase);
     if(!cmd) return;
-    /* mientras la app habla, solo órdenes de corte (evita que se dispare con su propia voz) */
-    if((hablando||speechSynthesis.speaking) && !/^(silencio|arde|fuga|nueva|despacio|rapido)$/.test(cmd)) return;
+    /* mientras la app habla (y 1,2 s después, por el eco), solo "silencio":
+       evita que su propia voz dispare cambios de escenario u otros comandos */
+    if((hablando || speechSynthesis.speaking || Date.now()-finTTS<1200) && cmd!=="silencio") return;
     ejecutarComando(cmd);
   };
-  recCmd.onend = ()=>{ if(recCmd){ try{recCmd.start();}catch(e){} } };
-  recCmd.onerror = e=>{ if(e.error==="not-allowed") pararComandos(); };
+  recCmd.onstart = ()=>{
+    recFallos = 0;
+    if(!hablando && !speechSynthesis.speaking)
+      setEstado(modo==="home"? "ESCUCHANDO":"ESCUCHANDO COMANDOS","escuchando");
+  };
+  recCmd.onend = ()=>{
+    if(!recCmd) return;
+    recFallos++;
+    const espera = Math.min(5000, 250*recFallos);
+    setTimeout(()=>{ if(recCmd){ try{recCmd.start();}catch(e){} } }, espera);
+  };
+  recCmd.onerror = e=>{
+    if(e.error==="not-allowed" || e.error==="service-not-allowed"){
+      pararComandos();
+      setEstado("MICRÓFONO SIN PERMISO — toca 🎤","");
+    } else if(e.error==="network"){
+      setEstado("SIN RED: VOZ NO DISPONIBLE","");
+    } else if(e.error==="audio-capture"){
+      setEstado("FALLO DE MICRÓFONO","");
+    }
+    /* "no-speech" y "aborted" son normales: onend reintenta solo */
+  };
   try{ recCmd.start(); setEstado("ESCUCHANDO","escuchando"); }catch(e){}
 }
 function pararComandos(){
@@ -603,9 +656,34 @@ $("btnNo").onclick = ()=> volverAHome(null);
 document.querySelectorAll("#botonera .bgrande").forEach(b=>{ b.onclick=()=>ejecutarComando(b.dataset.cmd); });
 speechSynthesis.onvoiceschanged = ()=>{};
 
+/* ===================== PWA: OFFLINE + PANTALLA ENCENDIDA ===================== */
+if("serviceWorker" in navigator){
+  window.addEventListener("load", ()=>{ navigator.serviceWorker.register("sw.js").catch(()=>{}); });
+}
+async function pedirWakeLock(){
+  try{
+    if("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen");
+  }catch(e){ wakeLock = null; }
+}
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState==="visible"){
+    pedirWakeLock();
+    /* al volver a primer plano, reactivar la escucha si se había caído */
+    if(SR && recCmd){ try{recCmd.start();}catch(e){} }
+    else if(SR && !recCmd && !recSust) iniciarComandos();
+  }
+});
+window.addEventListener("online", ()=>{
+  if(recCmd || modo!=="home") setEstado(recCmd? (modo==="home"?"ESCUCHANDO":"ESCUCHANDO COMANDOS"):"EN ESPERA", recCmd?"escuchando":"");
+});
+window.addEventListener("offline", ()=>{
+  setEstado("SIN RED: FICHA VISIBLE, VOZ LIMITADA","");
+});
+
 /* Arranque: si ya hay permiso de micro, queda a la escucha de "Vulcano, <sustancia>".
    La primera visita requiere un toque (política del navegador). */
 window.addEventListener("load", ()=>{
+  pedirWakeLock();
   if(SR) setTimeout(()=>{ if(modo==="home" && !recSust && !recCmd) iniciarComandos(); }, 800);
 });
 </script>
